@@ -165,12 +165,23 @@ local function GetFlyoutDirection(button)
    return direction
 end
 
+local function RunOriginalOnLeave(button)
+   if not button.preFlyoutOnLeave then return end
+
+   -- Legacy scripts use the global this; replacement bars may accept self.
+   local previousThis = this
+   this = button
+   pcall(button.preFlyoutOnLeave, button)
+   this = previousThis
+end
+
 local function FlyoutBarButton_OnLeave()
+   RunOriginalOnLeave(this)
    this.updateTooltip = nil
    GameTooltip:Hide()
 
    local focus = GetMouseFocus()
-   if focus and not strfind(focus:GetName(), 'Flyout') then
+   if not focus or not focus:GetName() or not strfind(focus:GetName(), 'Flyout') then
       Flyout_Hide()
    end
 end
@@ -182,40 +193,47 @@ local function FlyoutBarButton_OnEnter()
 end
 
 local function UpdateBarButton(slot)
+   -- The slot may no longer have a visible button (for example after paging).
+   flyouts[slot] = nil
    local button = Flyout_GetActionButton(slot)
    if button then
       local arrow = _G[button:GetName() .. 'FlyoutArrow']
       if arrow then
          arrow:Hide()
+         arrow:SetFrameStrata(arrow.flyoutOriginalStrata)
       end
 
-      if not HasAction(slot) or not GetActionText(slot) then
-          -- Reset button to pre-Flyout condition.
-         button.flyoutActionType = nil
-         button.flyoutAction = nil
-         if button.preFlyoutOnEnter then
-            button:SetScript('OnEnter', button.preFlyoutOnEnter)
-            button:SetScript('OnLeave', button.preFlyoutOnLeave)
-            button.preFlyoutOnEnter = nil
-            button.preFlyoutOnLeave = nil
+      -- Always discard the previous assignment, including when replaced by
+      -- another macro. Track hooks separately because an original script can be nil.
+      if button.flyoutHooked then
+         -- Clear custom hover/press visuals before detaching the old flyout.
+         RunOriginalOnLeave(button)
+         button:SetScript('OnEnter', button.preFlyoutOnEnter)
+         button:SetScript('OnLeave', button.preFlyoutOnLeave)
+         button.preFlyoutOnEnter = nil
+         button.preFlyoutOnLeave = nil
+         button.flyoutHooked = nil
+         -- Replacement action bars may use Button instead of CheckButton.
+         if button.SetChecked then
+            button:SetChecked(false)
          end
-
-         flyouts[slot] = nil
-         return
       end
-
+      button.flyoutActionType = nil
+      button.flyoutAction = nil
+      button.flyoutActions = nil
       button.sticky = false
       button.flyoutDirection = nil
+
+      if not HasAction(slot) or not GetActionText(slot) then
+         return
+      end
 
       local icon = false
       local macro = GetActionText(slot)
       local _, _, body = GetMacroInfo(GetMacroIndexByName(macro))
+      if type(body) ~= 'string' then return end
       local s, e = strfind(body, '/flyout')
       if s and s == 1 and e == 7 then
-         if not button.preFlyoutOnEnter then
-            button.preFlyoutOnEnter = button:GetScript('OnEnter')
-            button.preFlyoutOnLeave = button:GetScript('OnLeave')
-         end
 
          -- Identify sticky menus.
          if strfind(body, '%[sticky%]') then
@@ -244,6 +262,10 @@ local function UpdateBarButton(slot)
          end
 
          strsplit(body, ';', button.flyoutActions)
+         if table.getn(button.flyoutActions) == 0 then
+            button.flyoutActions = nil
+            return
+         end
 
          if table.getn(button.flyoutActions) > 0 then
             local cost
@@ -270,6 +292,9 @@ local function UpdateBarButton(slot)
 
          Flyout_UpdateFlyoutArrow(button)
 
+         button.preFlyoutOnEnter = button:GetScript('OnEnter')
+         button.preFlyoutOnLeave = button:GetScript('OnLeave')
+         button.flyoutHooked = true
          button:SetScript('OnLeave', FlyoutBarButton_OnLeave)
          button:SetScript('OnEnter', FlyoutBarButton_OnEnter)
       end
@@ -297,8 +322,13 @@ local function HandleEvent()
       scanner:AddFontStrings(scanner.nameText, scanner.rankText)
       scanner:AddFontStrings(scanner.manaText, scanner:CreateFontString())
    elseif event == 'ACTIONBAR_SLOT_CHANGED' then
-      Flyout_Hide(true)  -- Keep sticky menus open.
-      UpdateBarButton(arg1)
+      -- Open menus still refer to the old assignment after a move or swap.
+      Flyout_Hide()
+      if not arg1 or arg1 == 0 then
+         Flyout_UpdateBars()
+      else
+         UpdateBarButton(arg1)
+      end
       return
    end
 
@@ -423,6 +453,7 @@ function FlyoutBarButton_OnUpdate()
 end
 
 function Flyout_Show(button)
+   Flyout_Hide()
    local direction = GetFlyoutDirection(button)
    local size = Flyout_Config['BUTTON_SIZE']
    local offset = size
@@ -443,6 +474,7 @@ function Flyout_Show(button)
       local texture = nil
 
       b.flyoutAction, b.flyoutActionType, texture = GetFlyoutActionInfo(n)
+      b:SetChecked(false)
 
       if texture then
          b:ClearAllPoints()
@@ -461,7 +493,7 @@ function Flyout_Show(button)
          end
 
          -- Force an instant update.
-         this.lastUpdate = nil
+         b.lastUpdate = nil
          FlyoutBarButton_UpdateCooldown(b, true)
 
          if direction == 'BOTTOM' then
@@ -580,6 +612,8 @@ original.UseAction = UseAction
 function UseAction(slot, checkCursor, onSelf)
    original.UseAction(slot, checkCursor, onSelf)
 
+   -- Do not execute a cached flyout belonging to a previous slot assignment.
+   UpdateBarButton(slot)
    Flyout_OnClick(Flyout_GetActionButton(slot))
    Flyout_Hide()
 end
